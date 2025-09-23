@@ -69,6 +69,10 @@ custom_reward_function:
   # The name of the reward function within the specified file. Default is 'compute_score'.
   name: compute_score
 
+reward_config:
+  verification_reward_type: baseline
+  auxiliary_rewards: ""
+
 # config for the algorithm
 algorithm:
 
@@ -184,6 +188,10 @@ trainer:
   # Whether to run validation only
   val_only: False
 
+  # Whether to use reward shaping
+  use_reward_shaping: False
+  do_replay: False
+
   # Validation frequency (in training iterations)
   test_freq: -1
 
@@ -214,6 +222,14 @@ trainer:
   # whether to use legacy worker implementation
   #  mode: "auto", "enable", or "disable"
   use_legacy_worker_impl: auto
+
+  rejection_sample: False
+  save_online_data:
+    enabled: False
+    path: ${trainer.default_local_dir}/online_data
+    online_save_freq: 10
+    train_data_size: 5000
+    val_data_size: 200
 
 
 # profiler configs
@@ -317,3 +333,4 @@ ray_kwargs:
 
   # Path to save Ray timeline JSON for performance profiling
   timeline_json_file: null
+

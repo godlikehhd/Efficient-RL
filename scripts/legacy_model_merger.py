@@ -743,7 +743,7 @@ def main():
         "is_value_model": args.is_value_model,
         "local_dir": args.local_dir,
         "hf_model_path": args.hf_model_path,
-        "hf_model_config_path": args.local_dir,
+        "hf_model_config_path": args.local_dir + "/huggingface",
     }
 
     if args.operation == "merge":

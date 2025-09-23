@@ -24,7 +24,7 @@ from omegaconf import OmegaConf
 
 from verl.experimental.dataset.sampler import AbstractSampler
 from verl.trainer.constants_ppo import get_ppo_ray_runtime_env
-from verl.trainer.ppo.ray_trainer import RayPPOTrainer
+from verl.trainer.ppo.ray_trainer_rr import RayPPOTrainer
 from verl.trainer.ppo.reward import load_reward_manager
 from verl.trainer.ppo.utils import need_critic, need_reference_policy
 from verl.utils.config import validate_config
@@ -39,6 +39,11 @@ def main(config):
     Args:
         config_dict: Hydra configuration dictionary containing training parameters.
     """
+    os.environ["VERIFICATION_REWARD_TYPE"] = config.reward_config.verification_reward_type
+    os.environ["AUXILIARY_REWARDS"] = config.reward_config.auxiliary_rewards
+    print(f"VERIFICATION_REWARD_TYPE: {os.environ['VERIFICATION_REWARD_TYPE']}")
+    print(f"AUXILIARY_REWARDS: {os.environ['AUXILIARY_REWARDS']}")
+
     run_ppo(config)
 
 

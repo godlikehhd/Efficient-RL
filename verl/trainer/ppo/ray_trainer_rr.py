@@ -21,11 +21,13 @@ This trainer supports model-agonistic model initialization with huggingface
 import json
 import os
 import uuid
+import time
 from collections import defaultdict
 from copy import deepcopy
 from dataclasses import dataclass, field
 from pprint import pprint
 from typing import Optional
+
 
 import numpy as np
 import ray
@@ -37,7 +39,7 @@ from tqdm import tqdm
 
 from verl import DataProto
 from verl.experimental.dataset.sampler import AbstractCurriculumSampler
-from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
+from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto, DataProtoItem
 from verl.single_controller.ray import RayClassWithInitArgs, RayResourcePool, RayWorkerGroup
 from verl.single_controller.ray.base import create_colocated_worker_cls
 from verl.trainer.config import AlgoConfig
@@ -59,6 +61,80 @@ from verl.utils.rollout_skip import RolloutSkip
 from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seqlen_unbalance
 from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
+
+
+def dataprotoitem_to_dataproto(item: DataProtoItem) -> DataProto:
+    """Convert a DataProtoItem to a DataProto object"""
+    return DataProto.from_dict(
+        tensors=item.batch,  # TensorDict is already in correct format
+        non_tensors=item.non_tensor_batch,  # Dict is already in correct format 
+        meta_info=item.meta_info
+    )
+
+def select_buffer(buffer, config, batch):
+    import numpy as np
+    import torch
+    rollout_n = config.actor_rollout_ref.rollout.n
+    batch_size = len(batch) // rollout_n
+    world_size = config.trainer.nnodes * config.trainer.n_gpus_per_node
+    num_selection = 64 - batch_size  # 初始期望选择多少个 group
+    n_raw = len(buffer) // rollout_n
+    print(f"Before deduplication, buffer size: {n_raw}")
+    assert len(buffer) % rollout_n == 0, f"Buffer length must be divisible by {rollout_n}."
+    indices = buffer.non_tensor_batch['index']
+
+    for i in range(n_raw):
+        group = indices[i * rollout_n: (i + 1) * rollout_n]
+        assert np.all(group == group[0]), f"Index mismatch at group {i}"
+
+    # === 去重 ===
+    group_ids = indices[::rollout_n]
+    last_occurrence = {}
+    for i, gid in enumerate(group_ids):
+        last_occurrence[gid] = i
+
+    mask = np.zeros_like(indices, dtype=bool)
+    for i in last_occurrence.values():
+        start = i * rollout_n
+        mask[start:start + rollout_n] = True
+    deduped_buffer = buffer[mask.tolist()]
+
+    buffer = deduped_buffer
+    n_dedup = len(buffer) // rollout_n
+    print(f"After deduplication, buffer size: {n_dedup}")
+    assert len(buffer) % rollout_n == 0, f"Buffer length must be divisible by {rollout_n}."
+
+    indices = np.array(buffer.non_tensor_batch['index'], dtype=int)
+    unique_indices = np.array([indices[i] for i in range(0, len(indices), rollout_n)])
+
+    # === 动态选择数量，保证拼接 batch 后可整除 world_size ===
+    max_selectable = min(n_dedup, num_selection)
+
+    # 找到 <= max_selectable 的最大值，使得 (batch_size + k) * rollout_n % world_size == 0
+    valid_num = None
+    for k in range(max_selectable, 0, -1):
+        if (batch_size + k) * rollout_n % world_size == 0:
+            valid_num = k
+            break
+
+    if valid_num is None:
+        # 如果找不到，说明 buffer 太小或 batch 无法对齐，这里可以选择丢掉或报错
+        raise RuntimeError("Cannot find a valid selection number to make final batch divisible by world_size.")
+
+    selected_indices = list(range(0, valid_num * rollout_n))
+    selected_data = buffer.select_idxs(selected_indices)
+    buffer = buffer[valid_num * rollout_n:] if n_dedup > valid_num else None
+
+    return buffer, selected_data
+
+        
+
+    
+    
+    
+    
+    
+        
 
 
 @dataclass
@@ -325,6 +401,7 @@ class RayPPOTrainer:
         self.config = config
         self.reward_fn = reward_fn
         self.val_reward_fn = val_reward_fn
+        self.replay_buffer = None
 
         self.hybrid_engine = config.actor_rollout_ref.hybrid_engine
         assert self.hybrid_engine, "Currently, only support hybrid engine"
@@ -1081,7 +1158,9 @@ class RayPPOTrainer:
                     batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
                     batch = batch.union(gen_batch_output)
                     # batch = batch.union(gen_batch)
-
+                    
+                    # indices = batch.non_tensor_batch['index']
+                    # print(f"Batch Indices after repeat: {indices[:8]}")
                     if "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)
                     # Balance the number of valid tokens across DP ranks.
@@ -1089,9 +1168,10 @@ class RayPPOTrainer:
                     # which won't affect the advantage calculation (since it's based on uid),
                     # but might affect the loss calculation (due to the change of mini-batching).
                     # TODO: Decouple the DP balancing and mini-batching.
-                    if self.config.trainer.balance_batch:
-                        self._balance_batch(batch, metrics=metrics)
-
+                    # if self.config.trainer.balance_batch:
+                    #     self._balance_batch(batch, metrics=metrics)
+                    # indices = batch.non_tensor_batch['index']
+                    # print(f"Batch Indices after balance: {indices[:8]}")
                     # compute global_valid tokens
                     batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
 
@@ -1105,7 +1185,8 @@ class RayPPOTrainer:
                             future_reward = compute_reward_async.remote(data=batch, reward_fn=self.reward_fn)
                         else:
                             reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
-
+                    # indices = batch.non_tensor_batch['index']
+                    # print(f"Batch Indices before old_log_prob: {indices[:8]}")
                     # recompute old_log_probs
                     with marked_timer("old_log_prob", timing_raw, color="blue"):
                         old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
@@ -1117,6 +1198,8 @@ class RayPPOTrainer:
                         metrics.update(old_log_prob_metrics)
                         old_log_prob.batch.pop("entropys")
                         batch = batch.union(old_log_prob)
+                        # indices = batch.non_tensor_batch['index']
+                        # print(f"Batch Indices after old_log_prob: {indices[:8]}")
 
                         if "rollout_log_probs" in batch.batch.keys():
                             # TODO: we may want to add diff of probs too.
@@ -1132,7 +1215,8 @@ class RayPPOTrainer:
                             else:
                                 ref_log_prob = self.actor_rollout_wg.compute_ref_log_prob(batch)
                             batch = batch.union(ref_log_prob)
-
+                    # indices = batch.non_tensor_batch['index']
+                    # print(f"Batch Indices after ref: {indices[:8]}")
                     # compute values
                     if self.use_critic:
                         with marked_timer("values", timing_raw, color="cyan"):
@@ -1157,15 +1241,65 @@ class RayPPOTrainer:
                             metrics.update(kl_metrics)
                         else:
                             batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
-
+                        # indices = batch.non_tensor_batch['index']
+                        # print(f"Batch Indices after reward: {indices[:8]}")
                         # compute advantages, executed on the driver process
 
                         norm_adv_by_std_in_grpo = self.config.algorithm.get(
                             "norm_adv_by_std_in_grpo", True
                         )  # GRPO adv normalization factor
+                        
 
                         if self.config.trainer.use_reward_shaping:
-                            batch = self.reward_shaping(batch)
+                            batch = self.reward_shaping_rr(batch)
+                            metrics['replay_batch/num_reward_shaping'] = len(batch)   
+                        
+                        correct_num, wrong_num = self.compute_correct_ratio(batch)
+                        metrics['replay_batch/correct_num'] = correct_num
+                        metrics['replay_batch/wrong_num'] = wrong_num
+                        metrics['replay_batch/invalid_data_num'] = correct_num + wrong_num
+                        print(f"Correct num: {correct_num}, Wrong num: {wrong_num}, Invalid data num: {correct_num + wrong_num}")
+                        
+                        
+                        if self.config.trainer.do_replay:
+                            if epoch == 0:
+                                if self.replay_buffer is None:
+                                    self.replay_buffer = batch[:]
+                                    print(f"Size after reward shaping: {len(self.replay_buffer)}")
+                                else:
+                                    self.replay_buffer, replay_batch  = select_buffer(self.replay_buffer, self.config, batch)
+                                    if self.replay_buffer is None:
+                                        self.replay_buffer = batch[:]
+                                    else:
+                                        self.replay_buffer = DataProto.concat([self.replay_buffer, batch])
+                                        # self.replay_buffer = deduplicate_buffer(self.replay_buffer)
+                                    num_overlap_replay = len(replay_batch)
+                                    metrics['replay_batch/num_replay'] = num_overlap_replay
+                                    batch = DataProto.concat([batch, replay_batch])
+                            else:
+                                print("Replaying...")
+                                            
+                                start_time = time.time()
+                                self.replay_buffer, replay_batch = select_buffer(self.replay_buffer, self.config, batch) # add here
+                                if self.replay_buffer is None:
+                                    print("Buffer Cleared!")
+                                    self.replay_buffer = batch[:]
+                                else:
+                                    self.replay_buffer = DataProto.concat([self.replay_buffer, batch])
+                                elapsed_time = time.time() - start_time
+                                metrics['select_buffer'] = elapsed_time
+                                print(f"[select_buffer] Time elapsed: {elapsed_time:.3f} seconds")
+                                            
+                                self.replay_buffer = DataProto.concat([self.replay_buffer, batch]) # buffer_size- sigma*B, sigma*B
+                                # self.replay_buffer = deduplicate_buffer(self.replay_buffer)
+                                num_overlap_replay = len(np.intersect1d(batch.non_tensor_batch['index'], replay_batch.non_tensor_batch['index']))
+                                metrics['replay_batch/num_overlap'] = num_overlap_replay            
+                            
+                                ## recompute old log prob
+                                batch = DataProto.concat([batch, replay_batch])
+                        if self.config.trainer.balance_batch:
+                            self._balance_batch(batch, metrics=metrics)
+                        
 
                         batch = compute_advantage(
                             batch,
@@ -1313,16 +1447,63 @@ class RayPPOTrainer:
                     self.train_dataset.on_batch_end(batch=batch)
                 
                 
-                batch_keys=["rollout_log_probs", "input_ids", "position_ids", "attention_mask", "response_mask", "token_level_scores", 'old_log_probs', 'ref_log_prob']
-                save_path = os.path.join(self.config.trainer.default_local_dir, f"step{self.global_steps}.pkl")
+                # batch_keys=["rollout_log_probs", "input_ids", "position_ids", "attention_mask", "response_mask", "token_level_scores", 'old_log_probs', 'ref_log_prob']
+                # save_path = os.path.join(self.config.trainer.default_local_dir, f"step{self.global_steps}.pkl")
       
-                batch.pop(batch_keys=batch_keys)
-                batch.batch["advantages"] = batch.batch["advantages"][:, 0]
-                batch.batch["token_level_rewards"] = batch.batch["token_level_rewards"].sum(dim=-1)
-                batch.save_to_disk(save_path)
+                # batch.pop(batch_keys=batch_keys)
+                # batch.batch["advantages"] = batch.batch["advantages"][:, 0]
+                # batch.batch["token_level_rewards"] = batch.batch["token_level_rewards"].sum(dim=-1)
+                # batch.save_to_disk(save_path)
                 # import sys
                 # sys.exit(0)
     # --- 以下是您的原始函数及修改 ---
+
+    def reward_shaping_rr(self, batch: DataProto) -> DataProto:
+        rewards = batch.batch['token_level_scores'].sum(-1)
+        scores = rewards.cpu().numpy().astype(np.float32)
+        
+        batch_size = len(scores)
+        indices = np.array(batch.non_tensor_batch['index'])
+        unique_indices = np.unique(indices)
+
+        final_keep_indices = []
+
+        for uid in unique_indices:
+            uid_indices = np.where(indices == uid)[0]
+            uid_scores = scores[uid_indices]
+            num_rollouts = len(uid_scores)
+            num_success = int(uid_scores.sum())
+            correct_ratio = num_success / num_rollouts
+            
+            if correct_ratio > 0 and correct_ratio < 1:
+                final_keep_indices.extend(uid_indices)
+        final_keep_indices_arr = np.array(final_keep_indices)
+        keep_indices = np.sort(final_keep_indices_arr)
+        # ==================== 新增代码结束 ====================
+
+        batch = batch.select_idxs(keep_indices)
+        
+        return batch
+
+    def compute_correct_ratio(self, batch: DataProto) -> tuple[int, int]:
+        rewards = batch.batch['token_level_scores'].sum(-1)
+        scores = rewards.cpu().numpy().astype(np.float32)
+        indices = np.array(batch.non_tensor_batch['index'])
+        unique_indices = np.unique(indices)
+        correct_num = 0
+        wrong_num = 0
+        for uid in unique_indices:
+            uid_indices = np.where(indices == uid)[0]
+            uid_scores = scores[uid_indices]
+            num_rollouts = len(uid_scores)
+            num_success = int(uid_scores.sum())
+            correct_ratio = num_success / num_rollouts
+            if correct_ratio == 1:
+                correct_num += 1
+            elif correct_ratio == 0:
+                wrong_num += 1
+        return correct_num, wrong_num
+        
 
     def reward_shaping(self, batch: DataProto) -> DataProto:
         """
@@ -1337,10 +1518,10 @@ class RayPPOTrainer:
         
 
         rewards = batch.batch['token_level_scores'].sum(-1)
-        scores = (rewards.cpu().numpy() > 0.0).astype(np.float32)
+        scores = rewards.cpu().numpy().astype(np.float32)
         
         batch_size = len(scores)
-        uids = np.array(batch.non_tensor_batch['uid'])
+        indices = np.array(batch.non_tensor_batch['index'])
         unique_uids = np.unique(uids)
 
         # 这个列表将收集所有最终需要保留的样本在原始 batch 中的索引

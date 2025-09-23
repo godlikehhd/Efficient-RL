@@ -340,25 +340,52 @@ class vLLMRollout(BaseRollout):
             # TODO(sgm): disable logprob when recompute_log_prob is enable
             # if n = 1: (bs, response_length) ; if n > 1: (bs * n, response_length)
 
+
+
             response = []
             rollout_log_probs = []
+            rollout_entropies = []
+            # print(f"outputs: {len(outputs)}")
             for output in outputs:
                 for sample_id in range(len(output.outputs)):
                     response_ids = output.outputs[sample_id].token_ids
                     response.append(response_ids)
                     if self.config.calculate_log_probs:
                         curr_log_prob = []
-                        for i, logprob in enumerate(output.outputs[sample_id].logprobs):
-                            curr_log_prob.append(logprob[response_ids[i]].logprob)
-                        rollout_log_probs.append(curr_log_prob)
+                        curr_entropy = []
+                        for i, logprob_dict  in enumerate(output.outputs[sample_id].logprobs):
+                            token_ids = list(logprob_dict.keys())
+                            logprobs = torch.tensor([logprob.logprob for logprob in logprob_dict.values()],
+                                                    device=idx.device)  # (k,)
+                            # if i == 0:
+                            #     print(f"logprobs: {logprobs.shape}")
+                            # 计算概率分布
+                            probs = logprobs.exp()
+                            probs = probs / probs.sum(dim=-1, keepdim=True)
 
+                            # 计算熵: -sum(p log p)
+                            entropy = -(probs * probs.log()).sum()
+                            curr_entropy.append(entropy.item())
+
+                            # 保存当前 token 的采样 logprob（对应实际生成的 token）
+                            curr_log_prob.append(logprob_dict[response_ids[i]].logprob)
+                        rollout_log_probs.append(curr_log_prob)
+                        rollout_entropies.append(curr_entropy)
+            
             response = pad_2d_list_to_length(response, self.pad_token_id, max_length=self.config.response_length).to(
                 idx.device
             )
+            
+            # print(f"response: {response.shape}")
+            # print(f"rollout_entropies: {rollout_entropies.shape}")
             if self.config.calculate_log_probs:
                 rollout_log_probs = pad_2d_list_to_length(
                     rollout_log_probs, -1, max_length=self.config.response_length
                 ).to(idx.device)
+                rollout_entropies = pad_2d_list_to_length(
+                    rollout_entropies, -1, max_length=self.config.response_length
+                ).to(idx.device)
+                rollout_entropies = rollout_entropies.to(torch.float32)
                 rollout_log_probs = rollout_log_probs.to(torch.float32)
 
             seq = torch.cat([idx, response], dim=-1)
@@ -394,6 +421,7 @@ class vLLMRollout(BaseRollout):
         if self.config.calculate_log_probs:
             # we will recompute old log prob with actor
             batch["rollout_log_probs"] = rollout_log_probs
+            batch["rollout_entropies"] = rollout_entropies
 
         return DataProto(batch=batch, non_tensor_batch=non_tensor_batch)
 

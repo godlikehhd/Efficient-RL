@@ -437,6 +437,9 @@ reward_model:
 custom_reward_function:
   path: null
   name: compute_score
+reward_config:
+  verification_reward_type: baseline
+  auxiliary_rewards: ''
 algorithm:
   _target_: verl.trainer.config.AlgoConfig
   gamma: 1.0
@@ -475,6 +478,7 @@ trainer:
   resume_from_path: null
   val_before_train: true
   val_only: false
+  use_reward_shaping: false
   test_freq: -1
   critic_warmup: 0
   default_hdfs_dir: null
@@ -485,6 +489,13 @@ trainer:
   ray_wait_register_center_timeout: 300
   device: cuda
   use_legacy_worker_impl: auto
+  rejection_sample: false
+  save_online_data:
+    enabled: false
+    path: ${trainer.default_local_dir}/online_data
+    online_save_freq: 10
+    train_data_size: 5000
+    val_data_size: 200
 global_profiler:
   _target_: verl.utils.profiler.ProfilerConfig
   tool: null
