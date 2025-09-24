@@ -361,15 +361,18 @@ class vLLMRollout(BaseRollout):
                             #     print(f"logprobs: {logprobs.shape}")
                             # 计算概率分布
                             probs = logprobs.exp()
+                            # print(f"probs: {probs}")
                             probs = probs / probs.sum(dim=-1, keepdim=True)
 
                             # 计算熵: -sum(p log p)
                             entropy = -(probs * probs.log()).sum()
+                            # print(f"entropy: {entropy}")
                             curr_entropy.append(entropy.item())
 
                             # 保存当前 token 的采样 logprob（对应实际生成的 token）
                             curr_log_prob.append(logprob_dict[response_ids[i]].logprob)
                         rollout_log_probs.append(curr_log_prob)
+
                         rollout_entropies.append(curr_entropy)
             
             response = pad_2d_list_to_length(response, self.pad_token_id, max_length=self.config.response_length).to(
@@ -385,6 +388,7 @@ class vLLMRollout(BaseRollout):
                 rollout_entropies = pad_2d_list_to_length(
                     rollout_entropies, -1, max_length=self.config.response_length
                 ).to(idx.device)
+                print(f"rollout_entropies: {rollout_entropies[:5, :5]}")
                 rollout_entropies = rollout_entropies.to(torch.float32)
                 rollout_log_probs = rollout_log_probs.to(torch.float32)
 

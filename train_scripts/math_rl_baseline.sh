@@ -1,7 +1,8 @@
 set -x
 WORKING_DIR=verl
-WORKING_ROOT_DIR=$(dirname $WORKING_DIR)
+WORKING_ROOT_DIR=$(pwd)
 echo pwd: $(pwd)
+echo WORKING_ROOT_DIR: ${WORKING_ROOT_DIR}
 unset VLLM_USE_MODELSCOPE LMDEPLOY_USE_MODELSCOPE
 
 export WANDB_MODE=offline
@@ -10,39 +11,39 @@ export WANDB_API_KEY=16b5bad0d1c1d68b959a024003969f9620561990
 
 
 GPU_NUMS=8
-WORLD_SIZE=2
+WORLD_SIZE=1
 
 DATA_NAME=deepscaler
 # TRAIN_DATA_PATH="[$(echo ${WORKING_ROOT_DIR}/data/qwen-math/math-level3to5/train.parquet)]"
-TRAIN_DATA_PATH="[$(echo ${WORKING_ROOT_DIR}/data/qwen-math/deepscaler/train.parquet)]"
+TRAIN_DATA_PATH="[$(echo ${WORKING_ROOT_DIR}/data/qwen-math/deepscaler/train_generation_4k_ufo.parquet)]"
 TEST_DATA_PATH="[$(echo ${WORKING_ROOT_DIR}/data/eval-data-no-system-prompt/aime24x10.parquet),$(echo ${WORKING_ROOT_DIR}/data/eval-data-no-system-prompt/aime25x10.parquet),$(echo ${WORKING_ROOT_DIR}/data/eval-data-no-system-prompt/amc23.parquet),$(echo ${WORKING_ROOT_DIR}/data/eval-data-no-system-prompt/math500.parquet),$(echo ${WORKING_ROOT_DIR}/data/eval-data-no-system-prompt/olympiadbench.parquet)]"
 
-MODEL_NAME=DeepSeek-R1-Distill-Qwen-1.5B
-MODEL_PATH=/nfsdata/yhe/models/DeepSeek-R1-Distill-Qwen-1.5B
+MODEL_NAME=Qwen2.5-Math-1.5B-Instruct
+MODEL_PATH=/nfsdata/yhe/models/Qwen2.5-Math-1.5B-Instruct
 
-REWARD_FN_PATH=${WORKING_ROOT_DIR}/verl/utils/reward_score/math_verification.py
+REWARD_FN_PATH="${WORKING_ROOT_DIR}/verl/utils/reward_score/math_verification.py"
 
 EXP_NOTE=test-2k-no-entctl-${VERIFICATION_REWARD_TYPE}
 
-PROJECT_NAME=baseline-verl-grpo2
+PROJECT_NAME=baseline-verl-grpo-ufo
 EXPERIMENT_NAME=${EXP_NOTE}-${MODEL_NAME}-${DATA_NAME}-NODE${WORLD_SIZE}
 OUTPUT_DIR=checkpoints/${PROJECT_NAME}/${EXPERIMENT_NAME}
 mkdir -p ${OUTPUT_DIR}
 
-PROMPT_LENGTH=2048
-RESPONSE_LENGTH=6144
+PROMPT_LENGTH=1536
+RESPONSE_LENGTH=2560
 NUM_BATCHED_TOKENS=$((${PROMPT_LENGTH} + ${RESPONSE_LENGTH}))
 MAX_TOKEN_PER_GPU=$(((${PROMPT_LENGTH} + ${RESPONSE_LENGTH}) * 2))
 
-VERIFICATION_REWARD_TYPE=fix_imbalance
-AUXILIARY_REWARDS="'non_short_response,no_code'"
+VERIFICATION_REWARD_TYPE=baseline
+AUXILIARY_REWARDS=none
 
 
 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
     data.train_files=${TRAIN_DATA_PATH} \
     data.val_files=${TEST_DATA_PATH} \
-    data.train_batch_size=64 \
+    data.train_batch_size=128 \
     data.max_prompt_length=${PROMPT_LENGTH} \
     data.max_response_length=${RESPONSE_LENGTH} \
     data.filter_overlong_prompts=True \
@@ -63,13 +64,13 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.name=vllm \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.7 \
     +actor_rollout_ref.rollout.logprobs=10 \
-    actor_rollout_ref.rollout.n=8 \
-    actor_rollout_ref.rollout.temperature=0.6 \
+    actor_rollout_ref.rollout.n=7 \
+    actor_rollout_ref.rollout.temperature=1.0 \
     actor_rollout_ref.rollout.enforce_eager=False \
     actor_rollout_ref.rollout.free_cache_engine=False \
     actor_rollout_ref.rollout.max_num_batched_tokens=${NUM_BATCHED_TOKENS} \
     actor_rollout_ref.rollout.val_kwargs.do_sample=True \
-    actor_rollout_ref.rollout.val_kwargs.temperature=0.6 \
+    actor_rollout_ref.rollout.val_kwargs.temperature=1.0 \
     actor_rollout_ref.rollout.calculate_log_probs=True \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
     algorithm.kl_ctrl.kl_coef=0.001 \

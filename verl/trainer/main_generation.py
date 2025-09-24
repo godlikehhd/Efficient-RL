@@ -95,14 +95,14 @@ def main_task(config):
     total_samples = len(dataset)
 
     config_batch_size = config.data.batch_size
+    print(f"config_batch_size: {config_batch_size}")
     apply_chat_template_kwargs = config.data.get("apply_chat_template_kwargs", {})
     num_batch = -(-total_samples // config_batch_size)
-    output_lst = [[] for _ in range(config.data.n_samples)]
-    output_lst_entropy = []
-    output_lst_log_probs = []
-    for batch_idx in range(num_batch):
+    output_texts_total = []
+    for batch_idx in tqdm(range(num_batch), desc="Processing batches"):
         print(f"[{batch_idx + 1}/{num_batch}] Start to process.")
         batch_chat_lst = chat_lst[batch_idx * config_batch_size : (batch_idx + 1) * config_batch_size]
+        batch_size = len(batch_chat_lst)
         inputs = tokenizer.apply_chat_template(
             batch_chat_lst,
             add_generation_prompt=True,
@@ -120,54 +120,45 @@ def main_task(config):
         batch_dict = {"input_ids": input_ids, "attention_mask": attention_mask, "position_ids": position_ids}
 
         data = DataProto.from_dict(batch_dict)
+        data = data.repeat(config.data.n_samples)
         data_padded, pad_size = pad_dataproto_to_divisor(data, wg.world_size)
+
 
         # START TO GENERATE FOR n_samples TIMES
         print(f"[{batch_idx + 1}/{num_batch}] Start to generate.")
-        for n_sample in tqdm(range(config.data.n_samples), desc="Generating"):
-            output_padded = wg.generate_sequences(data_padded)
-            output = unpad_dataproto(output_padded, pad_size=pad_size)
-            print('generate done')
-            output_texts = []
-            
-            for i in tqdm(range(len(output)), desc="Processing output"):
-                data_item = output[i]
-                prompt_length = data_item.batch["prompts"].shape[-1]
-                valid_response_length = data_item.batch["attention_mask"][prompt_length:].sum()
-                valid_response_ids = data_item.batch["responses"][:valid_response_length]
-                # valid_entropy_lists = data_item.batch['rollout_entropies']
-                response_str = tokenizer.decode(valid_response_ids, skip_special_tokens=True)
-                output_texts.append(response_str)
-                # output_entropy.append(valid_entropy_lists)
-            entropy_lists = output.batch['rollout_entropies']
-            log_probs_lists = output.batch['rollout_log_probs']
-            print("log_probs_lists.shape", log_probs_lists.shape)
-            print("entropy_lists.shape", entropy_lists.shape)
-            output_lst[n_sample].extend(output_texts)
-            output_lst_entropy.append(entropy_lists)
-            output_lst_log_probs.append(log_probs_lists)
-    output_lst_log_probs = torch.stack(output_lst_log_probs, dim=0)
-    output_lst_log_probs = torch.transpose(output_lst_log_probs, 0, 1)
-    print("output_lst_log_probs.shape", output_lst_log_probs.shape)
-    # convert output_lst from (n_samples, n_data) to (n_data, n_sampels)
-    output_lst = np.array(output_lst, dtype=object)
-    output_lst = np.transpose(output_lst, axes=(1, 0)).tolist()
-    output_lst_entropy = torch.cat(output_lst_entropy, dim=0)
-    output_lst_entropy = torch.transpose(output_lst_entropy, 0, 1)
-    print("output_lst_entropy.shape", output_lst_entropy.shape)
-    # add to the data frame
-    # dataset: DataProto = DataProto.from_single_dict(dataset)
-    dataset["responses"] = output_lst
-    # dataset["rollout_entropies"] = output_lst_entropy
-    # dataset["rollout_log_probs"] = output_lst_log_probs
-    # write to a new parquet
-    output_dir = os.path.dirname(config.data.output_path)
-    makedirs(output_dir, exist_ok=True)
+        output_padded = wg.generate_sequences(data_padded)
+        output = unpad_dataproto(output_padded, pad_size=pad_size)
+        print('generate done')
+        output_texts = []
+        for i in tqdm(range(len(output)), desc="Processing output"):
+            data_item = output[i]
+            prompt_length = data_item.batch["prompts"].shape[-1]
+            valid_response_length = data_item.batch["attention_mask"][prompt_length:].sum()
+            valid_response_ids = data_item.batch["responses"][:valid_response_length]
+            # valid_entropy_lists = data_item.batch['rollout_entropies']
+            response_str = tokenizer.decode(valid_response_ids, skip_special_tokens=True)
+            output_texts.append(response_str)
+            # output_entropy.append(valid_entropy_lists)
+        entropy_lists = output.batch['rollout_entropies']
+        log_probs_lists = output.batch['rollout_log_probs']
+        print("log_probs_lists.shape", log_probs_lists.shape)
+        print("entropy_lists.shape", entropy_lists.shape)
+        output_texts = np.array(output_texts, dtype=object)
+        output_texts = output_texts.reshape(batch_size, config.data.n_samples)
+        output_texts_total.append(output_texts)
+        output_dir = os.path.dirname(config.data.output_path)
+        makedirs(output_dir, exist_ok=True)
+        save_path_entropy = config.data.output_path.replace(".parquet", f"_{batch_idx}_entropy.pkl")
+        save_path_log_probs = config.data.output_path.replace(".parquet", f"_{batch_idx}_log_probs.pkl")
+        torch.save({"output_lst_entropy":entropy_lists}, save_path_entropy)
+        torch.save({"output_lst_log_probs":log_probs_lists}, save_path_log_probs)
+    output_texts_total = np.concatenate(output_texts_total, axis=0)
+    print("output_texts_total.shape", output_texts_total.shape)
+    output_texts_total = output_texts_total.tolist()
+    dataset["responses"] = output_texts_total
     dataset.to_parquet(config.data.output_path)
-    save_path_entropy = config.data.output_path.replace(".parquet", "_entropy.pkl")
-    save_path_log_probs = config.data.output_path.replace(".parquet", "_log_probs.pkl")
-    torch.save({"output_lst_entropy":output_lst_entropy}, save_path_entropy)
-    torch.save({"output_lst_log_probs":output_lst_log_probs}, save_path_log_probs)
+        
+        
 
 
 if __name__ == "__main__":

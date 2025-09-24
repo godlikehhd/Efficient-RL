@@ -7,7 +7,7 @@ set -x
 
 
 data_path=/nfsdata/yhe/verl/data/qwen-math/deepscaler/train.parquet
-save_path=/nfsdata/yhe/verl/analysis_data/train_all_generation_math_instruct.parquet
+save_path=/nfsdata/yhe/verl/analysis_data/train_generation.parquet
 model_path=/nfsdata/yhe/models/Qwen2.5-Math-1.5B-Instruct
 
 
@@ -17,6 +17,7 @@ python3 -m verl.trainer.main_generation \
     data.path=$data_path \
     data.prompt_key=prompt \
     data.n_samples=16 \
+    data.batch_size=256 \
     data.output_path=$save_path \
     model.path=$model_path \
     +model.trust_remote_code=True \
@@ -25,6 +26,8 @@ python3 -m verl.trainer.main_generation \
     rollout.calculate_log_probs=True \
     rollout.prompt_length=1536 \
     rollout.response_length=2560 \
+    rollout.top_k=-1 \
+    rollout.top_p=1.0 \
     +rollout.logprobs=10 \
     rollout.tensor_model_parallel_size=1 \
     rollout.gpu_memory_utilization=0.8
