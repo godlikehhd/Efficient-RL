@@ -38,11 +38,41 @@ def compute_score(data_source, solution_str, ground_truth, extra_info):
             res = test_verification_reward(data_source, solution_str, ground_truth, extra_info)
         else:
             res = train_verification_reward(data_source, solution_str, ground_truth, extra_info)
+    elif data_source == "difficulty":
+        res = difficulty_reward(data_source, solution_str, ground_truth, extra_info)
 
     else:
         raise NotImplementedError(f"Reward function is not implemented for {data_source=}")
 
     return res
+def extract_difficulty(input_string: str):
+    # 只查找 </think> 之前的部分
+    if "</think>" in input_string:
+        search_string = input_string.split("</think>")[0]
+    else:
+        search_string = input_string
+
+    # 匹配 Difficulty:\boxed{score} 形式
+    pattern = r"Difficulty:\s*\\boxed\{([^}]*)\}"
+    match = re.search(pattern, search_string)
+    if match:
+        return match.group(1).strip()  # 提取括号里的 score
+
+    return None
+
+def difficulty_reward(data_source, solution_str, ground_truth, extra_info=None):
+    reward = 0.0
+    reward_dict = {}
+    diffculty = extract_difficulty(solution_str)
+    if diffculty is None:
+        return reward
+    else:
+        ground_truth = float(ground_truth)
+        diffculty = float(diffculty)
+        bias = abs(diffculty - ground_truth) / 100
+        reward = 1 - bias
+    reward_dict["score"] = reward
+    return reward_dict
 
 
 def math_verify_reward(data_source, solution_str, ground_truth, extra_info=None):

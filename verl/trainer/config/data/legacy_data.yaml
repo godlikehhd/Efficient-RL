@@ -62,6 +62,12 @@ filter_overlong_prompts: False
 # Use multiprocessing to speed up. Default is 1.
 filter_overlong_prompts_workers: 1
 
+# Whether to make difficulty data.
+make_difficulty_data: False
+
+# Add system prompt to the data.
+add_system_prompt: False
+
 # Truncate the input_ids or prompt if they exceed max_prompt_length.
 # Options: 'error', 'left', 'right', 'middle'. Default is 'error'.
 truncation: error

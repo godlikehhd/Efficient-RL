@@ -298,7 +298,10 @@ class TaskRunner:
         # Create training and validation datasets.
         train_dataset = create_rl_dataset(config.data.train_files, config.data, tokenizer, processor, is_train=True)
         val_dataset = create_rl_dataset(config.data.val_files, config.data, tokenizer, processor, is_train=False)
+        if config.data.get("make_difficulty_data", False):
+            train_dataset_difficulty = create_rl_dataset(config.data.train_files, config.data, tokenizer, processor, is_train=True, make_difficulty_data=True)
         train_sampler = create_rl_sampler(config.data, train_dataset)
+        difficulty_sampler = create_rl_sampler(config.data, train_dataset_difficulty)
 
         # Initialize the PPO trainer.
         trainer = RayPPOTrainer(
@@ -312,6 +315,8 @@ class TaskRunner:
             val_reward_fn=val_reward_fn,
             train_dataset=train_dataset,
             val_dataset=val_dataset,
+            train_dataset_difficulty=train_dataset_difficulty,
+            difficulty_sampler=difficulty_sampler,
             collate_fn=collate_fn,
             train_sampler=train_sampler,
         )
@@ -321,7 +326,7 @@ class TaskRunner:
         trainer.fit()
 
 
-def create_rl_dataset(data_paths, data_config, tokenizer, processor, is_train=True):
+def create_rl_dataset(data_paths, data_config, tokenizer, processor, is_train=True, make_difficulty_data=False):
     """Create a dataset.
 
     Arguments:
@@ -366,6 +371,7 @@ def create_rl_dataset(data_paths, data_config, tokenizer, processor, is_train=Tr
         tokenizer=tokenizer,
         processor=processor,
         config=data_config,
+        make_difficulty_data=make_difficulty_data,
     )
 
     return dataset

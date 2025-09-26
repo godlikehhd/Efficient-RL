@@ -371,8 +371,6 @@ class RayPPOTrainer:
         val_reward_fn=None,
         train_dataset: Optional[Dataset] = None,
         val_dataset: Optional[Dataset] = None,
-        train_dataset_difficulty: Optional[Dataset] = None,
-        difficulty_sampler: Optional[Sampler] = None,
         collate_fn=None,
         train_sampler: Optional[Sampler] = None,
         device_name=None,
@@ -433,9 +431,9 @@ class RayPPOTrainer:
 
         self.trained_data_path = os.path.join(self.config.trainer.default_local_dir, "trained_data.parquet")
 
-        self._create_dataloader(train_dataset, val_dataset, train_dataset_difficulty, difficulty_sampler, collate_fn, train_sampler)
+        self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
 
-    def _create_dataloader(self, train_dataset, val_dataset, train_dataset_difficulty, difficulty_sampler, collate_fn, train_sampler: Optional[Sampler]):
+    def _create_dataloader(self, train_dataset, val_dataset, collate_fn, train_sampler: Optional[Sampler]):
 
         # #create online data 
         # if os.path.exists(os.path.join(self.config.trainer.save_online_data.path, "train-latest.parquet")):
@@ -480,14 +478,6 @@ class RayPPOTrainer:
             val_dataset = create_rl_dataset(
                 self.config.data.val_files, self.config.data, self.tokenizer, self.processor
             )
-        if self.config.data.make_difficulty_data:
-            if train_dataset_difficulty is None:
-                train_dataset_difficulty = create_rl_dataset(
-                    self.config.data.train_files, self.config.data, self.tokenizer, self.processor, make_difficulty_data=True
-                )
-            if difficulty_sampler is None:
-                difficulty_sampler = create_rl_sampler(self.config.data, train_dataset_difficulty)
-            self.train_dataset_difficulty, self.difficulty_sampler = train_dataset_difficulty, difficulty_sampler
         self.train_dataset, self.val_dataset = train_dataset, val_dataset
 
         if train_sampler is None:
@@ -498,7 +488,7 @@ class RayPPOTrainer:
             collate_fn = default_collate_fn
 
         num_workers = self.config.data["dataloader_num_workers"]
-            
+
         self.train_dataloader = StatefulDataLoader(
             dataset=self.train_dataset,
             batch_size=self.config.data.get("gen_batch_size", self.config.data.train_batch_size),
@@ -508,16 +498,14 @@ class RayPPOTrainer:
             sampler=train_sampler,
         )
 
-        if self.config.data.make_difficulty_data:
-
-            self.train_dataloader_difficulty = StatefulDataLoader(
-                dataset=self.train_dataset_difficulty,
-                batch_size=self.config.data.get("gen_batch_size", self.config.data.train_batch_size),
-                num_workers=num_workers,
-                drop_last=True,
-                collate_fn=collate_fn,
-                sampler=difficulty_sampler,
-            )
+        self.train_dataloader_difficulty = StatefulDataLoader(
+            dataset=self.train_dataset,
+            batch_size=self.config.data.get("gen_batch_size", self.config.data.train_batch_size),
+            num_workers=num_workers,
+            drop_last=True,
+            collate_fn=collate_fn,
+            sampler=train_sampler,
+        )
 
         val_batch_size = self.config.data.val_batch_size  # Prefer config value if set
         if val_batch_size is None:
@@ -534,7 +522,6 @@ class RayPPOTrainer:
 
         assert len(self.train_dataloader) >= 1, "Train dataloader is empty!"
         assert len(self.val_dataloader) >= 1, "Validation dataloader is empty!"
-
 
         print(
             f"Size of train dataloader: {len(self.train_dataloader)}, Size of val dataloader: "
@@ -1115,8 +1102,7 @@ class RayPPOTrainer:
         next_step_profile = False
 
         for epoch in range(self.config.trainer.total_epochs):
-            
-            for batch_dict_train, batch_dict_difficulty in zip(self.train_dataloader, self.train_dataloader_difficulty):
+            for batch_dict in self.train_dataloader:
                 metrics = {}
                 timing_raw = {}
 
@@ -1131,24 +1117,19 @@ class RayPPOTrainer:
                         else curr_step_profile
                     )
 
-                batch: DataProto = DataProto.from_single_dict(batch_dict_train)
-                batch_difficulty: DataProto = DataProto.from_single_dict(batch_dict_difficulty)
-                batch_idx = batch.non_tensor_batch['index']
-                batch_idx_difficulty = batch_difficulty.non_tensor_batch['index']
-                assert torch.all(batch_idx == batch_idx_difficulty), "batch_idx and batch_idx_difficulty must be the same"
+                batch: DataProto = DataProto.from_single_dict(batch_dict)
 
-                batch = DataProto.concat([batch, batch_difficulty])
                 # add uid to batch
                 batch.non_tensor_batch["uid"] = np.array(
                     [str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object
                 )
-
 
                 gen_batch = self._get_gen_batch(batch)
 
                 # pass global_steps to trace
                 gen_batch.meta_info["global_steps"] = self.global_steps
                 gen_batch = gen_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
+
                 is_last_step = self.global_steps >= self.total_training_steps
 
                 with marked_timer("step", timing_raw):
@@ -1184,18 +1165,13 @@ class RayPPOTrainer:
 
                     # repeat to align with repeated responses in rollout
                     batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
-                    # split_size = len(gen_batch_total) // 2
-                    # gen_batch_output, gen_batch_output_difficulty = DataProto.split(gen_batch_total, split_size=split_size)
                     batch = batch.union(gen_batch_output)
-                    # batch_difficulty = batch_difficulty.union(gen_batch_output_difficulty)
                     # batch = batch.union(gen_batch)
                     
                     # indices = batch.non_tensor_batch['index']
                     # print(f"Batch Indices after repeat: {indices[:8]}")
                     if "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)
-                    # if "response_mask" not in batch_difficulty.batch.keys():
-                    #     batch_difficulty.batch["response_mask"] = compute_response_mask(batch_difficulty)
                     # Balance the number of valid tokens across DP ranks.
                     # NOTE: This usually changes the order of data in the `batch`,
                     # which won't affect the advantage calculation (since it's based on uid),
@@ -1207,8 +1183,6 @@ class RayPPOTrainer:
                     # print(f"Batch Indices after balance: {indices[:8]}")
                     # compute global_valid tokens
                     batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
-                    split_size = len(batch) // 2
-                    batch, batch_difficulty = DataProto.split(batch, split_size=split_size)
 
                     with marked_timer("reward", timing_raw, color="yellow"):
                         # compute reward model score
@@ -1223,8 +1197,6 @@ class RayPPOTrainer:
                     # indices = batch.non_tensor_batch['index']
                     # print(f"Batch Indices before old_log_prob: {indices[:8]}")
                     # recompute old_log_probs
-                    batch = DataProto.concat([batch, batch_difficulty])
-
                     with marked_timer("old_log_prob", timing_raw, color="blue"):
                         old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
                         entropys = old_log_prob.batch["entropys"]
@@ -1260,8 +1232,6 @@ class RayPPOTrainer:
                             values = self.critic_wg.compute_values(batch)
                             batch = batch.union(values)
 
-
-                    batch, batch_difficulty = DataProto.split(batch, split_size=split_size)
                     with marked_timer("adv", timing_raw, color="brown"):
                         # we combine with rule-based rm
                         reward_extra_infos_dict: dict[str, list]
@@ -1269,25 +1239,17 @@ class RayPPOTrainer:
                             reward_tensor, reward_extra_infos_dict = ray.get(future_reward)
                         batch.batch["token_level_scores"] = reward_tensor
 
-
                         if reward_extra_infos_dict:
                             batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
-                        correct_ratios = self.compute_correct_ratio(batch)
-                        batch_difficulty.batch["ground_truth"] = correct_ratios
-                        reward_tensor_difficulty, reward_extra_infos_dict_difficulty = compute_reward(batch_difficulty, self.reward_fn)
-                        batch_difficulty.batch["token_level_scores"] = reward_tensor_difficulty
-                        if reward_extra_infos_dict_difficulty:
-                            batch_difficulty.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict_difficulty.items()})
-                        batch = DataProto.concat([batch, batch_difficulty])
 
                         # compute rewards. apply_kl_penalty if available
-                        # if self.config.algorithm.use_kl_in_reward:
-                        #     batch, kl_metrics = apply_kl_penalty(
-                        #         batch, kl_ctrl=self.kl_ctrl_in_reward, kl_penalty=self.config.algorithm.kl_penalty
-                        #     )
-                        #     metrics.update(kl_metrics)
-                        # else:
-                        #     batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
+                        if self.config.algorithm.use_kl_in_reward:
+                            batch, kl_metrics = apply_kl_penalty(
+                                batch, kl_ctrl=self.kl_ctrl_in_reward, kl_penalty=self.config.algorithm.kl_penalty
+                            )
+                            metrics.update(kl_metrics)
+                        else:
+                            batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
                         # indices = batch.non_tensor_batch['index']
                         # print(f"Batch Indices after reward: {indices[:8]}")
                         # compute advantages, executed on the driver process
@@ -1301,11 +1263,11 @@ class RayPPOTrainer:
                             batch = self.reward_shaping_rr(batch)
                             metrics['replay_batch/num_reward_shaping'] = len(batch)   
                         
-                        # correct_num, wrong_num = self.compute_correct_ratio(batch)
-                        # metrics['replay_batch/correct_num'] = correct_num
-                        # metrics['replay_batch/wrong_num'] = wrong_num
-                        # metrics['replay_batch/invalid_data_num'] = correct_num + wrong_num
-                        # print(f"Correct num: {correct_num}, Wrong num: {wrong_num}, Invalid data num: {correct_num + wrong_num}")
+                        correct_num, wrong_num = self.compute_correct_ratio(batch)
+                        metrics['replay_batch/correct_num'] = correct_num
+                        metrics['replay_batch/wrong_num'] = wrong_num
+                        metrics['replay_batch/invalid_data_num'] = correct_num + wrong_num
+                        print(f"Correct num: {correct_num}, Wrong num: {wrong_num}, Invalid data num: {correct_num + wrong_num}")
                         
                         
                         if self.config.trainer.do_replay:
@@ -1652,27 +1614,5 @@ class RayPPOTrainer:
         
         return batch
 
-    def compute_correct_ratio(self, batch: DataProto) -> tuple[int, int]:
-        rewards = batch.batch['token_level_scores'].sum(-1)
-        scores = rewards.cpu().numpy().astype(np.float32)
-        
-        batch_size = len(scores)
-        indices = np.array(batch.non_tensor_batch['index'])
-        unique_uids = np.unique(indices)
-
-        # 这个列表将收集所有最终需要保留的样本在原始 batch 中的索引
-        correct_ratios = []
-
-        for uid in unique_uids:
-            # 获取当前 uid 对应的所有样本的索引和分数
-            uid_indices = np.where(indices == uid)[0]
-            uid_scores = scores[uid_indices]
-            
-            num_rollouts = len(uid_scores)
-            num_success = int(uid_scores.sum())
-            correct_ratio = num_success / num_rollouts
-            correct_ratios.extend([correct_ratio] * num_rollouts)
-        return correct_ratios
-
-
+    
             

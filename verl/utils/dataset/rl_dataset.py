@@ -88,6 +88,7 @@ class RLHFDataset(Dataset):
         tokenizer: PreTrainedTokenizer,
         config: DictConfig,
         processor: Optional[ProcessorMixin] = None,
+        make_difficulty_data: bool = False,
     ):
         if not isinstance(data_files, list | ListConfig):
             data_files = [data_files]
@@ -118,6 +119,8 @@ class RLHFDataset(Dataset):
         self.serialize_dataset = False
         self.return_multi_modal_inputs = config.get("return_multi_modal_inputs", True)
 
+        self.make_difficulty_data = make_difficulty_data
+        self.add_system_prompt = config.get("add_system_prompt", False)
         self._download()
         self._read_files_and_tokenize()
 
@@ -157,6 +160,8 @@ class RLHFDataset(Dataset):
 
                 def doc2len(doc) -> int:
                     messages = self._build_messages(doc)
+                    if self.add_system_prompt:
+                        messages = self._add_system_prompt(messages)
                     raw_prompt = self.processor.apply_chat_template(
                         messages, add_generation_prompt=True, tokenize=False, **self.apply_chat_template_kwargs
                     )
@@ -176,9 +181,12 @@ class RLHFDataset(Dataset):
             else:
 
                 def doc2len(doc) -> int:
+                    messages = doc[prompt_key]
+                    if self.add_system_prompt:
+                        messages = self._add_system_prompt(messages)
                     return len(
                         tokenizer.apply_chat_template(
-                            doc[prompt_key], add_generation_prompt=True, **self.apply_chat_template_kwargs
+                            messages, add_generation_prompt=True, **self.apply_chat_template_kwargs
                         )
                     )
 
@@ -190,6 +198,17 @@ class RLHFDataset(Dataset):
 
             print(f"filter dataset len: {len(dataframe)}")
         return dataframe
+    
+    def _add_system_prompt(self, messages: list):
+        if self.make_difficulty_data:
+            system_prompt = {'content': 'Your task is to identify whether the question is difficult for you to solve it, put your confidence level in a number between 0 and 100 include the Difficulty : {difficulty}',
+                            'role': 'system'}
+        else:
+            system_prompt = {'content': 'Your task is to follow a systematic, thorough reasoning process before providing the final solution. This involves analyzing, summarizing, exploring, reassessing, and refining your thought process through multiple iterations. Structure your response into two sections: Thought and Solution. In the Thought section, present your reasoning using the format: "<think>\n {thoughts} </think>\n". Each thought should include detailed analysis, brainstorming, verification, and refinement of ideas. After "</think>\n," in the Solution section, provide the final, logical, and accurate answer, clearly derived from the exploration in the Thought section. If applicable, include the answer in \\boxed{} for closed-form results like multiple choices or mathematical solutions.',
+                            'role': 'system'}
+        assert "system" not in messages[0], "system prompt already exists"
+        messages.insert(0, system_prompt)
+        return messages
 
     def resume_dataset_state(self):
         self.serialize_dataset = not hasattr(self, "original_data_files")
@@ -223,6 +242,8 @@ class RLHFDataset(Dataset):
                 message["content"] = content_list
 
         return messages
+    # def build_messages(self, example: dict, make_difficulty_data=False):
+    #     mass
 
     def __getitem__(self, item):
         """
@@ -230,6 +251,9 @@ class RLHFDataset(Dataset):
         """
         row_dict: dict = self.dataframe[item]
         messages = self._build_messages(row_dict)
+        if self.add_system_prompt:
+            messages = self._add_system_prompt(messages)
+            row_dict["data_source"] = 'difficulty'
         model_inputs = {}
 
         if self.processor is not None:
@@ -238,6 +262,8 @@ class RLHFDataset(Dataset):
             raw_prompt = self.processor.apply_chat_template(
                 messages, add_generation_prompt=True, tokenize=False, **self.apply_chat_template_kwargs
             )
+            if self.make_difficulty_data:
+                raw_prompt = raw_prompt +"\n<think>\nI should first analyze the difficulty of the question. After careful analysis, I believe that the difficulty of the question is as follows:\nDifficulty:\\boxed{"
             multi_modal_data = {}
 
             images = None
@@ -286,6 +312,8 @@ class RLHFDataset(Dataset):
             raw_prompt = self.tokenizer.apply_chat_template(
                 messages, add_generation_prompt=True, tokenize=False, **self.apply_chat_template_kwargs
             )
+            if self.make_difficulty_data:
+                raw_prompt = raw_prompt +"\n<think>\nI should first analyze the difficulty of the question. After careful analysis, I believe that the difficulty of the question is as follows:\nDifficulty:\\boxed{"
             model_inputs = self.tokenizer(raw_prompt, return_tensors="pt", add_special_tokens=False)
             input_ids = model_inputs.pop("input_ids")
             attention_mask = model_inputs.pop("attention_mask")
